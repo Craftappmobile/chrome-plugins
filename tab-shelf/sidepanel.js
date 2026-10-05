@@ -1,86 +1,46 @@
 import {
-  STORAGE_KEY, COLORS, load, update, addItem, addCategory, findCategory, findItem, isSavableUrl, faviconUrl,
+  STORAGE_KEY, SETTINGS_KEY, SNOOZED_ID, COLORS, load, update, loadSettings, updateSettings, withDefaults, addItem, addCategory,
+  findCategory, findItem, allItems, snoozeTab, dueTime, isSavableUrl, faviconUrl,
 } from './storage.js';
-
-const SETTINGS_KEY = 'settings';
-const $ = (sel) => document.querySelector(sel);
+import {
+  REPEATS, presetList, presetTime, nextOccurrence, formatWhen, formatDays, toInputValue, fromInputValue,
+} from './reminders.js';
+import { openCategoryAsGroup } from './tabs.js';
+import {
+  SLACK_ORIGIN, isWebhookUrl, postToSlack, buildDigest, buildCategoryMessage, collectOpenTabs,
+} from './slack.js';
+import {
+  $, el, icon, iconButton, plural, linksLabel, toast, showMenu, openDialog, confirmDialog,
+} from './ui.js';
 
 const listEl = $('#list');
 const searchEl = $('#search');
-const menuEl = $('#menu');
 
 let data = await load();
-let settings = (await chrome.storage.local.get(SETTINGS_KEY))[SETTINGS_KEY] ?? { openInNewTab: false };
+let settings = await loadSettings();
 let query = '';
+let showAllReminders = false;
 let dragging = null; // { type: 'item' | 'cat', id }
 
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== 'local') return;
+  if (changes[SETTINGS_KEY]) settings = withDefaults(changes[SETTINGS_KEY].newValue);
   if (changes[STORAGE_KEY]) {
     data = changes[STORAGE_KEY].newValue ?? data;
     render();
   }
-  if (changes[SETTINGS_KEY]) settings = changes[SETTINGS_KEY].newValue ?? settings;
 });
 
-// ---------- helpers ----------
-
-const ICONS = {
-  plus: '<path d="M11.25 4.5h1.5v6.75h6.75v1.5h-6.75v6.75h-1.5v-6.75H4.5v-1.5h6.75z"/>',
-  open: '<path d="M4 6.5A2.5 2.5 0 0 1 6.5 4h7v1.5h-7a1 1 0 0 0-1 1v11a1 1 0 0 0 1 1h11a1 1 0 0 0 1-1v-7H20v7a2.5 2.5 0 0 1-2.5 2.5h-11A2.5 2.5 0 0 1 4 17.5zM15 3.5h5.5V9H19V6.06l-6.47 6.47-1.06-1.06L17.94 5H15z"/>',
-  edit: '<path d="M15.6 3.9a2 2 0 0 1 2.83 0l1.67 1.67a2 2 0 0 1 0 2.83L8.6 19.9 3.5 20.5l.6-5.1zm1.77 1.06a.5.5 0 0 0-.7 0l-1.32 1.32 2.37 2.37 1.32-1.32a.5.5 0 0 0 0-.7zM16.66 9.71l-2.37-2.37-8.77 8.77-.3 2.67 2.67-.3z"/>',
-  close: '<path d="m6.53 5.47 5.47 5.47 5.47-5.47 1.06 1.06L13.06 12l5.47 5.47-1.06 1.06L12 13.06l-5.47 5.47-1.06-1.06L10.94 12 5.47 6.53z"/>',
-  more: '<path d="M12 5.5a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3Zm0 8a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3Zm0 8a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3Z"/>',
-  chevron: '<path d="m9.53 5.47 6 6a.75.75 0 0 1 0 1.06l-6 6-1.06-1.06L13.94 12 8.47 6.53z"/>',
-};
-
-function icon(name) {
-  const span = document.createElement('span');
-  span.className = 'icon';
-  span.innerHTML = `<svg viewBox="0 0 24 24" aria-hidden="true">${ICONS[name]}</svg>`;
-  return span;
-}
-
-function el(tag, props = {}, ...children) {
-  const node = document.createElement(tag);
-  for (const [key, value] of Object.entries(props)) {
-    if (value === undefined || value === null || value === false) continue;
-    if (key === 'class') node.className = value;
-    else if (key === 'dataset') Object.assign(node.dataset, value);
-    else if (key.startsWith('on')) node.addEventListener(key.slice(2), value);
-    else if (key in node && typeof value !== 'string') node[key] = value;
-    else node.setAttribute(key, value === true ? '' : value);
-  }
-  node.append(...children.flat().filter((c) => c !== null && c !== undefined && c !== false));
-  return node;
-}
-
-function iconButton(name, title, onclick) {
-  return el('button', { class: 'icon-btn', type: 'button', title, 'aria-label': title, onclick }, icon(name));
-}
-
-let toastTimer;
-function toast(text) {
-  const t = $('#toast');
-  t.textContent = text;
-  t.hidden = false;
-  clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => { t.hidden = true; }, 2200);
-}
-
-function plural(n, one, few, many) {
-  const m10 = n % 10, m100 = n % 100;
-  if (m10 === 1 && m100 !== 11) return one;
-  if (m10 >= 2 && m10 <= 4 && (m100 < 12 || m100 > 14)) return few;
-  return many;
-}
-
-const linksLabel = (n) => `${n} ${plural(n, 'посилання', 'посилання', 'посилань')}`;
+// Keep "прострочено" labels fresh.
+setInterval(() => { if (!dragging && !document.querySelector('dialog[open]')) render(); }, 60 * 1000);
 
 async function activeTab() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   return tab;
 }
+
+const isOverdue = (r, now) => r.fired || dueTime(r) <= now;
+const isRepeating = (r) => Boolean(r.repeat) && r.repeat !== 'none';
 
 // ---------- rendering ----------
 
@@ -89,10 +49,16 @@ function render() {
   const fragment = document.createDocumentFragment();
   let shown = 0;
 
+  if (!q) {
+    const upcoming = renderReminders();
+    if (upcoming) fragment.append(upcoming);
+  }
+
   for (const cat of data.categories) {
+    if (cat.id === SNOOZED_ID && !cat.items.length) continue; // reappears when a tab is snoozed
     const nameMatch = q && cat.name.toLowerCase().includes(q);
     const items = q && !nameMatch
-      ? cat.items.filter((i) => `${i.title} ${i.url}`.toLowerCase().includes(q))
+      ? cat.items.filter((i) => `${i.title} ${i.url} ${i.note ?? ''}`.toLowerCase().includes(q))
       : cat.items;
     if (q && !items.length && !nameMatch) continue;
     fragment.append(renderCategory(cat, items, Boolean(q)));
@@ -107,12 +73,62 @@ function render() {
   listEl.replaceChildren(fragment);
 
   const total = data.categories.reduce((sum, c) => sum + c.items.length, 0);
-  $('#stats').textContent = `${data.categories.length} ${plural(data.categories.length, 'категорія', 'категорії', 'категорій')} · ${linksLabel(total)}`;
+  const reminders = allItems(data).filter(({ item }) => item.reminder && !item.done).length;
+  $('#stats').textContent = [
+    `${data.categories.length} ${plural(data.categories.length, 'категорія', 'категорії', 'категорій')}`,
+    linksLabel(total),
+    reminders ? `${reminders} ${plural(reminders, 'нагадування', 'нагадування', 'нагадувань')}` : null,
+  ].filter(Boolean).join(' · ');
+}
+
+function renderReminders() {
+  const now = Date.now();
+  const rows = allItems(data)
+    .filter(({ item }) => item.reminder && !item.done)
+    .sort((a, b) => dueTime(a.item.reminder) - dueTime(b.item.reminder));
+  if (!rows.length) return null;
+
+  const overdue = rows.filter(({ item }) => isOverdue(item.reminder, now)).length;
+  const limit = showAllReminders ? rows.length : 5;
+
+  return el('section', { class: 'reminders' },
+    el('div', { class: 'reminders-header' },
+      icon('bell'),
+      el('span', { class: 'cat-name' }, 'Нагадування'),
+      overdue ? el('span', { class: 'count overdue' }, `${overdue} прострочено`) : null),
+    el('ul', { class: 'items' }, rows.slice(0, limit).map(({ cat, item }) => {
+      const r = item.reminder;
+      const late = isOverdue(r, now);
+      const when = r.reopen ? `відкриється ${formatWhen(dueTime(r), now)}` : formatWhen(dueTime(r), now);
+      return el('li', { class: 'item', dataset: { id: item.id } },
+        el('a', {
+          class: 'item-link',
+          href: item.url,
+          title: `${item.title}\n${item.url}${item.note ? `\n\n${item.note}` : ''}`,
+          onclick: (e) => { e.preventDefault(); openUrl(item.url, e); },
+        },
+        el('img', { class: 'favicon', src: faviconUrl(item.url), alt: '', loading: 'lazy' }),
+        el('span', { class: 'item-title' }, item.title),
+        el('span', { class: `chip${late ? ' overdue' : ''}`, title: `${cat.name}${isRepeating(r) ? ` · ${REPEATS[r.repeat]}` : ''}` },
+          isRepeating(r) ? '↻ ' : '', when)),
+        el('span', { class: 'item-actions' },
+          r.reopen
+            ? iconButton('open', 'Відкрити зараз', () => completeReminder(item.id))
+            : iconButton('check', isRepeating(r) ? 'Готово (до наступного разу)' : 'Готово', () => completeReminder(item.id)),
+          iconButton('snooze', 'Відкласти', (e) => reminderMenu(e.currentTarget, item.id), { 'aria-haspopup': 'menu' })));
+    })),
+    rows.length > 5
+      ? el('button', {
+        class: 'show-more', type: 'button',
+        onclick: () => { showAllReminders = !showAllReminders; render(); },
+      }, showAllReminders ? 'Згорнути' : `Показати всі (${rows.length})`)
+      : null);
 }
 
 function renderCategory(cat, items, searching) {
   const collapsed = cat.collapsed && !searching;
   const color = COLORS[cat.color] ?? COLORS.grey;
+  const schedule = cat.schedule?.enabled ? cat.schedule : null;
 
   const header = el('div', {
     class: 'cat-header',
@@ -131,11 +147,12 @@ function renderCategory(cat, items, searching) {
   el('span', { class: 'caret' }, icon('chevron')),
   el('span', { class: 'dot', style: `background:${color}` }),
   el('span', { class: 'cat-name' }, cat.name),
+  schedule ? el('span', { class: 'sched', title: `Автовідкриття: ${formatDays(schedule.days)} о ${schedule.time}` }, icon('clock')) : null,
   el('span', { class: 'count' }, String(cat.items.length)),
   el('span', { class: 'cat-actions' },
     iconButton('plus', 'Зберегти поточну вкладку сюди', () => saveActiveTab(cat.id)),
     iconButton('open', 'Відкрити всі як групу вкладок', () => openCategory(cat.id)),
-    iconButton('edit', 'Перейменувати / змінити колір', () => editCategory(cat.id)),
+    iconButton('dots', 'Ще дії', (e) => categoryMenu(e.currentTarget, cat.id), { 'aria-haspopup': 'menu' }),
   ));
 
   const list = el('ul', { class: 'items' }, items.map((item) => renderItem(item)));
@@ -156,11 +173,13 @@ function renderCategory(cat, items, searching) {
 function renderItem(item) {
   let host = '';
   try { host = new URL(item.url).hostname; } catch { /* keep empty */ }
+  const r = item.done ? null : item.reminder;
+  const now = Date.now();
 
   const link = el('a', {
     class: 'item-link',
     href: item.url,
-    title: `${item.title}\n${item.url}`,
+    title: `${item.title}\n${item.url}${item.note ? `\n\n${item.note}` : ''}`,
     draggable: 'true',
     onclick: (e) => { e.preventDefault(); openUrl(item.url, e); },
     onauxclick: (e) => { if (e.button === 1) { e.preventDefault(); openUrl(item.url, { ctrlKey: true }); } },
@@ -175,11 +194,14 @@ function renderItem(item) {
   },
   el('img', { class: 'favicon', src: faviconUrl(item.url), alt: '', loading: 'lazy' }),
   el('span', { class: 'item-title' }, item.title),
-  host && host !== item.title ? el('span', { class: 'item-host' }, host) : null);
+  item.note ? el('span', { class: 'note-mark', title: item.note }, '✎') : null,
+  r ? el('span', { class: `chip${isOverdue(r, now) ? ' overdue' : ''}` }, icon('bell'), formatWhen(dueTime(r), now))
+    : (host && host !== item.title ? el('span', { class: 'item-host' }, host) : null));
 
-  const li = el('li', { class: 'item', dataset: { id: item.id } },
+  const li = el('li', { class: `item${item.done ? ' done' : ''}`, dataset: { id: item.id } },
     link,
     el('span', { class: 'item-actions' },
+      iconButton('bell', 'Нагадати', (e) => reminderMenu(e.currentTarget, item.id), { 'aria-haspopup': 'menu' }),
       iconButton('edit', 'Редагувати', () => editItem(item.id)),
       iconButton('close', 'Видалити', () => removeItem(item.id)),
     ));
@@ -260,13 +282,13 @@ async function onDrop(e, catId, section) {
   if (!isSavableUrl(url)) return;
   const openTab = (await chrome.tabs.query({})).find((t) => t.url === url);
   const added = await update((d) => {
-    const ok = addItem(d, catId, { url, title: openTab?.title });
+    const item = addItem(d, catId, { url, title: openTab?.title });
     const cat = findCategory(d, catId);
-    if (ok && beforeId) {
-      const item = cat.items.pop();
+    if (item && beforeId) {
+      cat.items.pop();
       cat.items.splice(Math.max(0, cat.items.findIndex((i) => i.id === beforeId)), 0, item);
     }
-    return ok;
+    return Boolean(item);
   });
   toast(added ? 'Посилання збережено' : 'Це посилання вже є в категорії');
 }
@@ -283,7 +305,7 @@ function moveItem(d, itemId, toCatId, beforeId) {
   to.items.splice(index, 0, found.item);
 }
 
-// ---------- actions ----------
+// ---------- links & categories ----------
 
 async function openUrl(url, e = {}) {
   if (e.shiftKey) return chrome.windows.create({ url });
@@ -303,7 +325,7 @@ async function saveActiveTab(catId) {
   const tab = await activeTab();
   if (!tab || !isSavableUrl(tab.url)) return toast('Цю сторінку не можна зберегти');
   const { added, name } = await update((d) => ({
-    added: addItem(d, catId, { url: tab.url, title: tab.title }),
+    added: Boolean(addItem(d, catId, { url: tab.url, title: tab.title })),
     name: findCategory(d, catId)?.name ?? 'Вхідні',
   }));
   toast(added ? `Збережено в «${name}»` : `Вже є в «${name}»`);
@@ -351,14 +373,7 @@ async function openCategory(catId) {
     });
     if (res.action !== 'ok') return;
   }
-  const win = await chrome.windows.getCurrent();
-  const tabIds = [];
-  for (const [n, item] of cat.items.entries()) {
-    const tab = await chrome.tabs.create({ url: item.url, active: n === 0, windowId: win.id });
-    tabIds.push(tab.id);
-  }
-  const groupId = await chrome.tabs.group({ tabIds, createProperties: { windowId: win.id } });
-  await chrome.tabGroups.update(groupId, { title: cat.name, color: cat.color in COLORS ? cat.color : 'grey' });
+  await openCategoryAsGroup(cat, (await chrome.windows.getCurrent()).id);
 }
 
 async function createCategory() {
@@ -372,8 +387,20 @@ async function createCategory() {
     ],
     okLabel: 'Створити',
   });
-  if (res.action !== 'ok') return;
-  await update((d) => addCategory(d, { name: res.values.name, color: res.values.color }));
+  if (res.action !== 'ok') return null;
+  return update((d) => addCategory(d, { name: res.values.name, color: res.values.color }));
+}
+
+function categoryMenu(anchor, catId) {
+  const cat = findCategory(data, catId);
+  if (!cat) return;
+  showMenu(anchor, [
+    { label: 'Перейменувати, колір…', icon: 'edit', action: () => editCategory(catId) },
+    { label: cat.schedule?.enabled ? 'Розклад автовідкриття (увімкнено)…' : 'Розклад автовідкриття…', icon: 'clock', action: () => editSchedule(catId) },
+    { label: 'Надіслати список у Slack', icon: 'open', action: () => sendCategoryToSlack(catId) },
+    '-',
+    { label: 'Видалити категорію…', icon: 'close', danger: true, action: () => deleteCategory(catId) },
+  ]);
 }
 
 async function editCategory(catId) {
@@ -395,43 +422,90 @@ async function editCategory(catId) {
       c.color = res.values.color;
     });
   } else if (res.action === 'delete') {
-    const confirm = await openDialog({
-      title: `Видалити «${cat.name}»?`,
-      message: cat.items.length ? `Разом із категорією буде видалено ${linksLabel(cat.items.length)}.` : 'Категорія порожня.',
-      okLabel: 'Видалити',
-      danger: true,
-    });
-    if (confirm.action !== 'ok') return;
-    await update((d) => { d.categories = d.categories.filter((c) => c.id !== catId); });
+    await deleteCategory(catId);
   }
 }
+
+async function deleteCategory(catId) {
+  const cat = findCategory(data, catId);
+  if (!cat) return;
+  const ok = await confirmDialog(`Видалити «${cat.name}»?`,
+    cat.items.length ? `Разом із категорією буде видалено ${linksLabel(cat.items.length)}.` : 'Категорія порожня.');
+  if (!ok) return;
+  await update((d) => { d.categories = d.categories.filter((c) => c.id !== catId); });
+}
+
+async function editSchedule(catId) {
+  const cat = findCategory(data, catId);
+  if (!cat) return;
+  const s = cat.schedule ?? { enabled: false, time: '09:00', days: [1, 2, 3, 4, 5] };
+  const res = await openDialog({
+    title: `Автовідкриття «${cat.name}»`,
+    fields: [
+      { type: 'help', text: 'У вибраний час усі посилання категорії відкриються групою вкладок. Chrome має бути запущений.' },
+      { name: 'enabled', type: 'checkbox', label: 'Відкривати автоматично', value: s.enabled },
+      { name: 'time', type: 'time', label: 'Час', value: s.time },
+      { name: 'days', type: 'days', label: 'Дні', value: s.days },
+    ],
+  });
+  if (res.action !== 'ok') return;
+  const { enabled, time, days } = res.values;
+  if (enabled && (!time || !days.length)) return toast('Вкажіть час і хоча б один день');
+  await update((d) => {
+    const c = findCategory(d, catId);
+    if (c) c.schedule = { enabled, time: time || s.time, days, lastRun: s.lastRun };
+  });
+  toast(enabled ? `Відкриватиметься ${formatDays(days)} о ${time}` : 'Автовідкриття вимкнено');
+}
+
+// ---------- items ----------
 
 async function editItem(itemId) {
   const found = findItem(data, itemId);
   if (!found) return;
+  const { item } = found;
   const res = await openDialog({
     title: 'Посилання',
     fields: [
-      { name: 'title', label: 'Назва', type: 'text', value: found.item.title, required: true },
-      { name: 'url', label: 'Адреса', type: 'url', value: found.item.url, required: true },
+      { name: 'title', label: 'Назва', type: 'text', value: item.title, required: true },
+      { name: 'url', label: 'Адреса', type: 'url', value: item.url, required: true },
       {
         name: 'cat', label: 'Категорія', type: 'select', value: found.cat.id,
         options: data.categories.map((c) => ({ value: c.id, label: c.name })),
       },
+      { name: 'note', label: 'Нотатка', type: 'textarea', value: item.note ?? '', placeholder: 'Що тут треба зробити?' },
+      { name: 'remindAt', label: 'Нагадати', type: 'datetime-local', value: toInputValue(item.reminder && dueTime(item.reminder)) },
+      {
+        name: 'repeat', label: 'Повтор', type: 'select', value: item.reminder?.repeat ?? 'none',
+        options: Object.entries(REPEATS).map(([value, label]) => ({ value, label })),
+      },
+      { name: 'done', label: 'Зроблено', type: 'checkbox', value: item.done },
     ],
     deleteLabel: 'Видалити',
   });
-  if (res.action === 'ok') {
-    await update((d) => {
-      const f = findItem(d, itemId);
-      if (!f) return;
-      f.item.title = res.values.title.trim() || f.item.title;
-      if (isSavableUrl(res.values.url)) f.item.url = res.values.url.trim();
-      if (res.values.cat !== f.cat.id) moveItem(d, itemId, res.values.cat, null);
-    });
-  } else if (res.action === 'delete') {
-    await removeItem(itemId);
-  }
+  if (res.action === 'delete') return removeItem(itemId);
+  if (res.action !== 'ok') return;
+
+  const v = res.values;
+  const at = fromInputValue(v.remindAt);
+  await update((d) => {
+    const f = findItem(d, itemId);
+    if (!f) return;
+    const it = f.item;
+    it.title = v.title.trim() || it.title;
+    if (isSavableUrl(v.url.trim())) it.url = v.url.trim();
+    if (v.note.trim()) it.note = v.note.trim();
+    else delete it.note;
+
+    const old = it.reminder;
+    if (!at) delete it.reminder;
+    else if (!old || at !== dueTime(old) || v.repeat !== old.repeat) it.reminder = { at, repeat: v.repeat, reopen: old?.reopen };
+
+    if (v.done && !it.done) Object.assign(it, { done: true, doneAt: Date.now() });
+    else if (!v.done) { delete it.done; delete it.doneAt; }
+
+    if (v.cat !== f.cat.id) moveItem(d, itemId, v.cat, null);
+  });
 }
 
 async function removeItem(itemId) {
@@ -443,23 +517,195 @@ async function removeItem(itemId) {
     f.cat.items.splice(f.index, 1);
   });
   if (!removed) return;
-  showUndo('Посилання видалено', () => update((d) => {
-    const cat = findCategory(d, removed.catId);
-    if (cat) cat.items.splice(removed.index, 0, removed.item);
-  }));
+  toast('Посилання видалено', {
+    actionLabel: 'Скасувати',
+    action: () => update((d) => {
+      const cat = findCategory(d, removed.catId);
+      if (cat) cat.items.splice(removed.index, 0, removed.item);
+    }),
+  });
 }
 
-function showUndo(text, undo) {
-  const t = $('#toast');
-  t.replaceChildren(text, el('button', {
-    class: 'link-btn',
-    type: 'button',
-    onclick: () => { t.hidden = true; undo(); },
-  }, 'Скасувати'));
-  t.hidden = false;
-  clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => { t.hidden = true; }, 5000);
+// ---------- reminders ----------
+
+function reminderMenu(anchor, itemId) {
+  const found = findItem(data, itemId);
+  if (!found) return;
+  const r = found.item.reminder;
+  showMenu(anchor, [
+    { heading: r ? `Зараз: ${formatWhen(dueTime(r))}` : 'Нагадати' },
+    ...presetList().map((p) => ({ label: p.label, action: () => setReminder(itemId, presetTime(p.key)) })),
+    { label: 'Обрати дату й повтор…', action: () => customReminder(itemId) },
+    ...(r ? ['-', { label: 'Прибрати нагадування', danger: true, action: () => clearReminder(itemId) }] : []),
+  ]);
 }
+
+async function setReminder(itemId, at, repeat) {
+  await update((d) => {
+    const it = findItem(d, itemId)?.item;
+    if (!it) return;
+    const old = it.reminder;
+    // Snoozing a repeating reminder keeps its series; everything else sets a fresh reminder.
+    if (old && !repeat && isRepeating(old)) {
+      old.snoozeUntil = at;
+      old.fired = false;
+    } else {
+      it.reminder = { at, repeat: repeat ?? 'none', reopen: old?.reopen };
+    }
+    delete it.done;
+    delete it.doneAt;
+  });
+  toast(`Нагадаю ${formatWhen(at)}`);
+}
+
+async function customReminder(itemId) {
+  const r = findItem(data, itemId)?.item.reminder;
+  const res = await openDialog({
+    title: 'Нагадування',
+    fields: [
+      { name: 'at', label: 'Коли', type: 'datetime-local', value: toInputValue(r ? dueTime(r) : presetTime('tomorrow')), required: true },
+      {
+        name: 'repeat', label: 'Повтор', type: 'select', value: r?.repeat ?? 'none',
+        options: Object.entries(REPEATS).map(([value, label]) => ({ value, label })),
+      },
+    ],
+    okLabel: 'Нагадати',
+  });
+  if (res.action !== 'ok') return;
+  const at = fromInputValue(res.values.at);
+  if (at) await setReminder(itemId, at, res.values.repeat);
+}
+
+async function clearReminder(itemId) {
+  await update((d) => {
+    const f = findItem(d, itemId);
+    if (!f) return;
+    // A snoozed tab without its reminder has no reason to stay in "Відкладені".
+    if (f.item.reminder?.reopen) f.cat.items.splice(f.index, 1);
+    else delete f.item.reminder;
+  });
+}
+
+async function completeReminder(itemId) {
+  const found = findItem(data, itemId);
+  const r = found?.item.reminder;
+  if (!r) return;
+  if (r.reopen) {
+    await chrome.tabs.create({ url: found.item.url });
+    return clearReminder(itemId);
+  }
+  await update((d) => {
+    const it = findItem(d, itemId)?.item;
+    const rem = it?.reminder;
+    if (!rem) return;
+    if (isRepeating(rem)) {
+      // A snoozed occurrence is finished by clearing the snooze; otherwise skip to the next one.
+      if (rem.snoozeUntil) delete rem.snoozeUntil;
+      else rem.at = nextOccurrence(rem.at, rem.repeat);
+      rem.fired = false;
+    } else {
+      delete it.reminder;
+      Object.assign(it, { done: true, doneAt: Date.now() });
+    }
+  });
+}
+
+function snoozeTabMenu(anchor) {
+  showMenu(anchor, [
+    { heading: 'Закрити вкладку й повернути її…' },
+    ...presetList().map((p) => ({ label: p.label, action: () => snoozeActiveTab(presetTime(p.key)) })),
+    { label: 'Обрати час…', action: snoozeActiveTabCustom },
+  ]);
+}
+
+async function snoozeActiveTab(at) {
+  const tab = await activeTab();
+  if (!tab || !isSavableUrl(tab.url)) return toast('Цю вкладку не можна відкласти');
+  const item = await update((d) => snoozeTab(d, tab, at));
+  if (!item) return;
+  await chrome.tabs.remove(tab.id);
+  toast(`Вкладка повернеться ${formatWhen(at)}`);
+}
+
+async function snoozeActiveTabCustom() {
+  const res = await openDialog({
+    title: 'Відкласти вкладку',
+    fields: [{ name: 'at', label: 'Повернути', type: 'datetime-local', value: toInputValue(presetTime('tomorrow')), required: true }],
+    okLabel: 'Відкласти',
+  });
+  const at = res.action === 'ok' && fromInputValue(res.values.at);
+  if (at) await snoozeActiveTab(at);
+}
+
+// ---------- Slack ----------
+
+async function slackSettings() {
+  const s = settings.slack;
+  const res = await openDialog({
+    title: 'Інтеграція зі Slack',
+    fields: [
+      {
+        type: 'help',
+        text: '1. Відкрийте api.slack.com/apps → Create New App → From scratch.\n'
+          + '2. Incoming Webhooks → увімкніть → Add New Webhook → виберіть канал (можна особистий).\n'
+          + '3. Скопіюйте адресу https://hooks.slack.com/… і вставте нижче.\n\n'
+          + 'У Slack потраплять назви й адреси ваших посилань. Відкриті вкладки — лише якщо ввімкнете пункт нижче.',
+      },
+      { name: 'webhookUrl', label: 'Адреса вебхука', type: 'url', value: s.webhookUrl, placeholder: 'https://hooks.slack.com/services/…' },
+      { name: 'sendReminders', type: 'checkbox', label: 'Дублювати нагадування в Slack (прийдуть і на телефон)', value: s.sendReminders },
+      { name: 'digestEnabled', type: 'checkbox', label: 'Надсилати підсумок роботи за розкладом', value: s.digestEnabled },
+      { name: 'digestTime', type: 'time', label: 'Час підсумку', value: s.digestTime },
+      { name: 'digestDays', type: 'days', label: 'Дні', value: s.digestDays },
+      { name: 'includeOpenTabs', type: 'checkbox', label: 'Додавати до підсумку відкриті вкладки', value: s.includeOpenTabs },
+    ],
+  });
+  if (res.action !== 'ok') return;
+
+  const v = res.values;
+  const url = v.webhookUrl.trim();
+  if (url && !isWebhookUrl(url)) return toast('Адреса має починатися з https://hooks.slack.com/');
+  // Requested right after the click on "Зберегти", while the user gesture is still active.
+  if (url && !(await chrome.permissions.request({ origins: [SLACK_ORIGIN] }))) {
+    return toast('Без дозволу на hooks.slack.com надсилання не працюватиме');
+  }
+  settings = await updateSettings((st) => {
+    Object.assign(st.slack, {
+      webhookUrl: url,
+      sendReminders: v.sendReminders,
+      digestEnabled: v.digestEnabled,
+      digestTime: v.digestTime || st.slack.digestTime,
+      digestDays: v.digestDays,
+      includeOpenTabs: v.includeOpenTabs,
+    });
+  });
+  if (url) toast('Slack підключено', { actionLabel: 'Надіслати тест', action: sendDigestNow });
+  else toast('Slack вимкнено');
+}
+
+async function withSlack(send) {
+  if (!settings.slack.webhookUrl) {
+    toast('Спершу підключіть Slack', { actionLabel: 'Налаштувати', action: slackSettings });
+    return;
+  }
+  try {
+    await send(settings.slack.webhookUrl);
+    toast('Надіслано в Slack');
+  } catch (e) {
+    toast(e.message, { duration: 5000 });
+  }
+}
+
+const sendDigestNow = () => withSlack(async (url) => {
+  const openTabs = settings.slack.includeOpenTabs ? await collectOpenTabs() : null;
+  await postToSlack(url, buildDigest(data, { openTabs }));
+});
+
+const sendCategoryToSlack = (catId) => withSlack(async (url) => {
+  const cat = findCategory(data, catId);
+  if (cat) await postToSlack(url, buildCategoryMessage(cat));
+});
+
+// ---------- import / export ----------
 
 async function importBookmarksBar() {
   // Must be the first await: permission requests need the user gesture.
@@ -512,97 +758,16 @@ async function importJson(file) {
       const cat = d.categories.find((c) => c.name === src.name)
         ?? addCategory(d, { name: src.name, color: src.color in COLORS ? src.color : 'blue' });
       for (const i of Array.isArray(src.items) ? src.items : []) {
-        if (addItem(d, cat.id, { url: i?.url, title: i?.title })) added++;
+        const item = addItem(d, cat.id, { url: i?.url, title: i?.title });
+        if (!item) continue;
+        if (typeof i.note === 'string') item.note = i.note;
+        if (Number.isFinite(i.reminder?.at)) item.reminder = { at: i.reminder.at, repeat: REPEATS[i.reminder.repeat] ? i.reminder.repeat : 'none' };
+        added++;
       }
     }
     return added;
   });
   toast(`Імпортовано ${linksLabel(count)}`);
-}
-
-async function setCollapsedAll(collapsed) {
-  await update((d) => d.categories.forEach((c) => { c.collapsed = collapsed; }));
-}
-
-async function toggleOpenInNewTab() {
-  settings = { ...settings, openInNewTab: !settings.openInNewTab };
-  await chrome.storage.local.set({ [SETTINGS_KEY]: settings });
-  toast(settings.openInNewTab ? 'Посилання відкриватимуться в новій вкладці' : 'Посилання відкриватимуться в поточній вкладці');
-}
-
-// ---------- popover menu ----------
-
-function showMenu(anchor, entries) {
-  menuEl.replaceChildren(...entries.map((entry) => {
-    if (entry === '-') return el('hr');
-    return el('button', {
-      type: 'button',
-      role: 'menuitem',
-      class: 'menu-item',
-      onclick: () => { hideMenu(); entry.action(); },
-    },
-    entry.color ? el('span', { class: 'dot', style: `background:${COLORS[entry.color] ?? COLORS.grey}` }) : null,
-    el('span', {}, entry.label),
-    entry.checked !== undefined ? el('span', { class: 'check' }, entry.checked ? '✓' : '') : null);
-  }));
-  menuEl.hidden = false;
-  const r = anchor.getBoundingClientRect();
-  const width = menuEl.offsetWidth;
-  menuEl.style.top = `${r.bottom + 4}px`;
-  menuEl.style.left = `${Math.max(8, Math.min(r.left, window.innerWidth - width - 8))}px`;
-  menuEl.querySelector('button')?.focus();
-}
-
-function hideMenu() {
-  menuEl.hidden = true;
-}
-
-document.addEventListener('click', (e) => {
-  if (!menuEl.hidden && !menuEl.contains(e.target) && !e.target.closest('[aria-haspopup="menu"]')) hideMenu();
-});
-document.addEventListener('keydown', (e) => { if (e.key === 'Escape') hideMenu(); });
-
-// ---------- dialog ----------
-
-function openDialog({ title, message = '', fields = [], okLabel = 'Зберегти', deleteLabel, danger = false }) {
-  const dialog = $('#dialog');
-  $('#dialogTitle').textContent = title;
-  $('#dialogMessage').textContent = message;
-  $('#dialogMessage').hidden = !message;
-  $('#dialogOk').textContent = okLabel;
-  $('#dialogOk').classList.toggle('danger', danger);
-  $('#dialogOk').classList.toggle('primary', !danger);
-  $('#dialogDelete').hidden = !deleteLabel;
-  if (deleteLabel) $('#dialogDelete').textContent = deleteLabel;
-
-  $('#dialogFields').replaceChildren(...fields.map((f) => {
-    let control;
-    if (f.type === 'color') {
-      control = el('div', { class: 'swatches', role: 'radiogroup' }, Object.entries(COLORS).map(([name, hex]) =>
-        el('label', { class: 'swatch', title: name },
-          el('input', { type: 'radio', name: f.name, value: name, checked: name === f.value }),
-          el('span', { style: `background:${hex}` }))));
-      return el('div', { class: 'field' }, el('span', { class: 'label' }, f.label), control);
-    }
-    if (f.type === 'select') {
-      control = el('select', { name: f.name },
-        f.options.map((o) => el('option', { value: o.value, selected: o.value === f.value }, o.label)));
-    } else {
-      control = el('input', { type: f.type, name: f.name, value: f.value, required: f.required, spellcheck: 'false' });
-    }
-    return el('label', { class: 'field' }, el('span', { class: 'label' }, f.label), control);
-  }));
-
-  dialog.returnValue = '';
-  dialog.showModal();
-  dialog.querySelector('input[type=text], input[type=url]')?.select();
-
-  return new Promise((resolve) => {
-    dialog.addEventListener('close', () => {
-      const values = Object.fromEntries(new FormData($('#dialogForm')));
-      resolve({ action: dialog.returnValue || 'cancel', values });
-    }, { once: true });
-  });
 }
 
 // ---------- wiring ----------
@@ -613,9 +778,19 @@ $('#moreBtn').addEventListener('click', (e) => showMenu(e.currentTarget, [
   { label: 'Зберегти всі вкладки вікна', action: saveWindowTabs },
   { label: 'Імпорт з панелі закладок Chrome', action: importBookmarksBar },
   '-',
-  { label: 'Згорнути всі категорії', action: () => setCollapsedAll(true) },
-  { label: 'Розгорнути всі категорії', action: () => setCollapsedAll(false) },
-  { label: 'Відкривати в новій вкладці', checked: Boolean(settings.openInNewTab), action: toggleOpenInNewTab },
+  { label: 'Надіслати підсумок у Slack зараз', action: sendDigestNow },
+  { label: 'Налаштування Slack…', action: slackSettings },
+  '-',
+  { label: 'Згорнути всі категорії', action: () => update((d) => d.categories.forEach((c) => { c.collapsed = true; })) },
+  { label: 'Розгорнути всі категорії', action: () => update((d) => d.categories.forEach((c) => { c.collapsed = false; })) },
+  {
+    label: 'Відкривати в новій вкладці',
+    checked: Boolean(settings.openInNewTab),
+    action: async () => {
+      settings = await updateSettings((s) => { s.openInNewTab = !s.openInNewTab; });
+      toast(settings.openInNewTab ? 'Посилання відкриватимуться в новій вкладці' : 'Посилання відкриватимуться в поточній вкладці');
+    },
+  },
   '-',
   { label: 'Експорт у файл (JSON)', action: exportJson },
   { label: 'Імпорт з файлу (JSON)', action: () => $('#importFile').click() },
@@ -627,14 +802,13 @@ $('#saveTabBtn').addEventListener('click', (e) => showMenu(e.currentTarget, [
   {
     label: '+ У нову категорію…',
     action: async () => {
-      const before = new Set(data.categories.map((c) => c.id));
-      await createCategory();
-      const created = (await load()).categories.find((c) => !before.has(c.id));
+      const created = await createCategory();
       if (created) await saveActiveTab(created.id);
     },
   },
 ]));
 
+$('#snoozeBtn').addEventListener('click', (e) => snoozeTabMenu(e.currentTarget));
 $('#addCatBtn').addEventListener('click', createCategory);
 
 $('#importFile').addEventListener('change', async (e) => {
@@ -650,7 +824,7 @@ searchEl.addEventListener('input', () => {
 
 searchEl.addEventListener('keydown', (e) => {
   if (e.key !== 'Enter') return;
-  const first = listEl.querySelector('.item-link');
+  const first = listEl.querySelector('.category .item-link');
   if (first) openUrl(first.getAttribute('href'), e);
 });
 
