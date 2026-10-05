@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="uk">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Tab Shelf</title>
+  <link rel="stylesheet" href="sidepanel.css">
+</head>
+<body>
+  <header class="toolbar">
+    <div class="search">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10.5 4a6.5 6.5 0 0 1 5.18 10.43l4.2 4.2-1.06 1.06-4.2-4.2A6.5 6.5 0 1 1 10.5 4Zm0 1.5a5 5 0 1 0 0 10 5 5 0 0 0 0-10Z"/></svg>
+      <input id="search" type="search" placeholder="Пошук у збережених…" autocomplete="off">
+    </div>
+    <button id="moreBtn" class="icon-btn" title="Ще дії" aria-haspopup="menu"></button>
+  </header>
+
+  <div class="quick">
+    <button id="saveTabBtn" class="btn primary" aria-haspopup="menu">Зберегти вкладку</button>
+    <button id="addCatBtn" class="btn">Нова категорія</button>
+  </div>
+
+  <main id="list" aria-live="polite"></main>
+
+  <footer id="stats" class="stats"></footer>
+
+  <div id="menu" class="menu" role="menu" hidden></div>
+  <div id="toast" class="toast" role="status" hidden></div>
+
+  <dialog id="dialog">
+    <form method="dialog" id="dialogForm">
+      <h2 id="dialogTitle"></h2>
+      <p id="dialogMessage" class="dialog-message"></p>
+      <div id="dialogFields" class="fields"></div>
+      <div class="dialog-buttons">
+        <button value="ok" class="btn primary" id="dialogOk">Зберегти</button>
+        <button value="cancel" class="btn" formnovalidate>Скасувати</button>
+        <button value="delete" class="btn danger" id="dialogDelete" formnovalidate hidden>Видалити</button>
+      </div>
+    </form>
+  </dialog>
+
+  <input id="importFile" type="file" accept="application/json,.json" hidden>
+
+  <script type="module" src="sidepanel.js"></script>
+</body>
+</html>

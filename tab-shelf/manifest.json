@@ -1,0 +1,32 @@
+{
+  "manifest_version": 3,
+  "name": "Tab Shelf — вкладки за категоріями",
+  "short_name": "Tab Shelf",
+  "version": "1.0.0",
+  "description": "Зберігайте необмежену кількість вкладок у бічній панелі та групуйте їх за категоріями.",
+  "minimum_chrome_version": "116",
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "action": {
+    "default_title": "Tab Shelf — відкрити панель"
+  },
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "permissions": ["storage", "unlimitedStorage", "sidePanel", "tabs", "tabGroups", "contextMenus", "favicon"],
+  "optional_permissions": ["bookmarks"],
+  "commands": {
+    "save-current-tab": {
+      "suggested_key": { "default": "Alt+Shift+S" },
+      "description": "Зберегти поточну вкладку у «Вхідні»"
+    }
+  }
+}
